@@ -179,21 +179,22 @@ let wrapCommand = function (fn, commandName, beforeCommand, afterCommand) {
                 return commandPromise
             }
 
+            let appliedPrototypeCommandPromise = commandPromise.then((commandResult) => {
+                /**
+                 * extend protoype of result so people can call browser.element(...).click()
+                 */
+                future.return(applyPrototype.call(this, commandResult))
+            }, future.throw.bind(future))
+
             /**
              * Try to execute with Fibers and fall back if can't.
              * This part is executed when we want to set a fiber context within a command (e.g. in waitUntil).
              */
             try {
-                commandPromise.then((commandResult) => {
-                    /**
-                     * extend protoype of result so people can call browser.element(...).click()
-                     */
-                    future.return(applyPrototype.call(this, commandResult))
-                }, future.throw.bind(future))
                 return future.wait()
             } catch (e) {
                 if (e.message === "Can't wait without a fiber") {
-                    return commandPromise
+                    return appliedPrototypeCommandPromise
                 }
                 throw e
             }
