@@ -1,12 +1,13 @@
 import Future from 'fibers/future'
-import Fiber from 'fibers'
 import assign from 'object.assign'
+const Fiber = require('fibers') // ToDo fix unit test to work with imports
 
 const SYNC_COMMANDS = ['domain', '_events', '_maxListeners', 'setMaxListeners', 'emit',
     'addListener', 'on', 'once', 'removeListener', 'removeAllListeners', 'listeners',
     'getMaxListeners', 'listenerCount', 'getPrototype']
 
 const STACKTRACE_FILTER = /((wdio-sync\/)*(build\/index.js|node_modules\/fibers)|- - - - -)/g
+const STACKTRACE_FILTER_FN = (e) => !e.match(STACKTRACE_FILTER)
 
 let commandIsRunning = false
 let forcePromises = false
@@ -28,7 +29,7 @@ let sanitizeErrorMessage = function (e) {
      * filter out stack traces to wdio-sync and fibers
      * and transform absolute path to relative
      */
-    stack = stack.filter((e) => !e.match(STACKTRACE_FILTER))
+    stack = stack.filter(STACKTRACE_FILTER_FN)
     stack = stack.map((e) => '    ' + e.replace(cwd + '/', '').trim())
 
     /**
@@ -124,7 +125,7 @@ let executeHooksWithArgs = (hooks = [], args) => {
  * @param  {Function} fn  function to wrap around
  * @return {Function}     wrapped around function
  */
-global.wdioSync = function (fn, done) {
+let wdioSync = global.wdioSync = function (fn, done) {
     return function (...args) {
         return Fiber(() => {
             const result = fn.apply(this, args)
@@ -273,7 +274,7 @@ let isElementsResult = function (result) {
     return (
         typeof result.selector === 'string' &&
         Array.isArray(result.value) && result.value.length &&
-        typeof result.value[0].ELEMENT !== undefined
+        typeof result.value[0].ELEMENT !== 'undefined'
     )
 }
 
@@ -295,6 +296,11 @@ let applyPrototype = function (result, helperScope) {
         return result
     }
 
+    const mapPrototype = (el) => {
+        let newInstance = Object.setPrototypeOf(Object.create(el), Object.getPrototypeOf(this))
+        return applyPrototype.call(newInstance, el, this)
+    }
+
     /**
      * overload elements results
      */
@@ -304,20 +310,14 @@ let applyPrototype = function (result, helperScope) {
             el.value = { ELEMENT: el.ELEMENT }
             el.index = i
             return el
-        }).map((el) => {
-            let newInstance = Object.setPrototypeOf(Object.create(el), Object.getPrototypeOf(this))
-            return applyPrototype.call(newInstance, el, this)
-        })
+        }).map(mapPrototype)
     }
 
     /**
      * overload $$ result
      */
     if (is$$Result(result)) {
-        return result.map((el) => {
-            let newInstance = Object.setPrototypeOf(Object.create(el), Object.getPrototypeOf(this))
-            return applyPrototype.call(newInstance, el, this)
-        })
+        return result.map(mapPrototype)
     }
 
     let prototype = {}
@@ -445,10 +445,10 @@ let wrapCommands = function (instance, beforeCommand, afterCommand) {
          * #functionalProgrammingWTF!
          */
         commandGroup[fnName] = wrapCommand(function (...args) {
-            return new Promise((r) => {
+            return new Promise((resolve) => {
                 const state = forcePromises
                 forcePromises = false
-                wdioSync(fn, r).apply(this, args)
+                wdioSync(fn, resolve).apply(this, args)
                 forcePromises = state
             })
         }, commandName, beforeCommand, afterCommand)
@@ -484,7 +484,7 @@ let executeSync = function (fn, repeatTest = 0, args = []) {
                 return reject(e)
             }
 
-            e.stack = e.stack.split('\n').filter((e) => !e.match(STACKTRACE_FILTER)).join('\n')
+            e.stack = e.stack.split('\n').filter(STACKTRACE_FILTER_FN).join('\n')
             reject(e)
         }
     })
@@ -509,37 +509,37 @@ let executeAsync = function (fn, repeatTest = 0, args = []) {
         result = fn.apply(this, args)
     } catch (e) {
         error = e
-    } finally {
-        /**
-         * handle errors that get thrown directly and are not cause by
-         * rejected promises
-         */
-        if (error) {
-            if (repeatTest) {
-                return executeAsync(fn, --repeatTest, args)
-            }
-            return new Promise((_, reject) => reject(error))
-        }
-
-        /**
-         * if we don't retry just return result
-         */
-        if (repeatTest === 0 || !result || typeof result.catch !== 'function') {
-            return new Promise(resolve => resolve(result))
-        }
-
-        /**
-         * handle promise response
-         */
-        return result.catch((e) => {
-            if (repeatTest) {
-                return executeAsync(fn, --repeatTest, args)
-            }
-
-            e.stack = e.stack.split('\n').filter((e) => !e.match(STACKTRACE_FILTER)).join('\n')
-            return Promise.reject(e)
-        })
     }
+
+    /**
+     * handle errors that get thrown directly and are not cause by
+     * rejected promises
+     */
+    if (error) {
+        if (repeatTest) {
+            return executeAsync(fn, --repeatTest, args)
+        }
+        return new Promise((resolve, reject) => reject(error))
+    }
+
+    /**
+     * if we don't retry just return result
+     */
+    if (repeatTest === 0 || !result || typeof result.catch !== 'function') {
+        return new Promise(resolve => resolve(result))
+    }
+
+    /**
+     * handle promise response
+     */
+    return result.catch((e) => {
+        if (repeatTest) {
+            return executeAsync(fn, --repeatTest, args)
+        }
+
+        e.stack = e.stack.split('\n').filter(STACKTRACE_FILTER_FN).join('\n')
+        return Promise.reject(e)
+    })
 }
 
 /**
@@ -554,13 +554,13 @@ let executeAsync = function (fn, repeatTest = 0, args = []) {
  * @return {Function}             wrapped framework hook function
  */
 let runHook = function (hookFn, origFn, before, after, repeatTest = 0) {
+    const hookError = (hookName) => (e) => console.error(`Error in ${hookName}: ${e.stack}`)
+
     return origFn(function () {
         // Print errors encountered in beforeHook and afterHook to console, but
         // don't propagate them to avoid failing the test. However, errors in
         // framework hook functions should fail the test, so propagate those.
-        return executeHooksWithArgs(before).catch((e) => {
-            console.error(`Error in beforeHook: ${e.stack}`)
-        }).then(() => {
+        return executeHooksWithArgs(before).catch(hookError('beforeHook')).then(() => {
             /**
              * user wants handle async command using promises, no need to wrap in fiber context
              */
@@ -568,13 +568,9 @@ let runHook = function (hookFn, origFn, before, after, repeatTest = 0) {
                 return executeAsync.call(this, hookFn, repeatTest)
             }
 
-            return new Promise((resolve, reject) =>
-                Fiber(() => executeSync.call(this, hookFn, repeatTest).then(() => resolve(), reject)).run()
-            )
+            return new Promise(runSync.call(this, hookFn, repeatTest))
         }).then(() => {
-            return executeHooksWithArgs(after).catch((e) => {
-                console.error(`Error in afterHook: ${e.stack}`)
-            })
+            return executeHooksWithArgs(after).catch(hookError('afterHook'))
         })
     })
 }
@@ -598,10 +594,16 @@ let runSpec = function (specTitle, specFn, origFn, repeatTest = 0) {
     }
 
     return origFn(specTitle, function () {
-        return new Promise((resolve, reject) =>
-            Fiber(() => executeSync.call(this, specFn, repeatTest).then(() => resolve(), reject)).run()
-        )
+        return new Promise(runSync.call(this, specFn, repeatTest))
     })
+}
+
+/**
+ * run hook or spec via executeSync
+ */
+function runSync (fn, repeatTest = 0) {
+    return (resolve, reject) =>
+        Fiber(() => executeSync.call(this, fn, repeatTest).then(() => resolve(), reject)).run()
 }
 
 /**
@@ -662,4 +664,12 @@ let runInFiberContext = function (testInterfaceFnNames, before, after, fnName) {
     }
 }
 
-export { wrapCommand, wrapCommands, runInFiberContext, executeHooksWithArgs, executeSync, executeAsync }
+export {
+    wrapCommand,
+    wrapCommands,
+    runInFiberContext,
+    executeHooksWithArgs,
+    executeSync,
+    executeAsync,
+    wdioSync
+}
